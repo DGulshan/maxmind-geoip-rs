@@ -87,7 +87,7 @@ impl From<VarError> for GeoIpError {
 }
 
 impl MaxMindDb {
-    pub async fn loopkup(ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
+    pub async fn lookup(ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         let db = database().await?;
         let geoip: geoip2::City = db.lookup(ip)?;
         Ok(GeoLocation::new(geoip))
