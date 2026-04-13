@@ -7,15 +7,17 @@ use tar::Archive;
 
 static DATABASE_EXPIRATION_DURATION: u64 = 3600 * 24 * 7;
 
-static DATABASE_FILE_PATH: &'static str = "./GeoLite2-City.mmdb";
+static DATABASE_FILE_PATH: &str = "./GeoLite2-City.mmdb";
 
-static DOWNLOADED_FILE: &'static str = "GeoLite2-City.mmdb.tar.gz";
+static DOWNLOADED_FILE: &str = "GeoLite2-City.mmdb.tar.gz";
 
-static TAR_FILE: &'static str = "GeoLite2-City.mmdb.tar";
+static TAR_FILE: &str = "GeoLite2-City.mmdb.tar";
 
-static MAXMIND_DB_LICENSE_KEY_ENV_VAR_NAME: &'static str = "MAXMIND_DB_LICENSE_KEY";
+static MAXMIND_DB_LICENSE_KEY_ENV_VAR_NAME: &str = "MAXMIND_DB_LICENSE_KEY";
 
-static UNKNOWN: &'static str = "Unknown";
+static MAXMIND_DB_URL_ENV_VAR_NAME: &str = "MAXMIND_DB_URL";
+
+static UNKNOWN: &str = "Unknown";
 
 #[derive(Clone, Debug)]
 pub struct GeoLocation {
@@ -105,7 +107,13 @@ async fn ready_database() -> Result<(), GeoIpError> {
         return Ok(());
     }
 
-    extract_database(&download_database().await?)
+    // If a direct URL to the .mmdb file is provided (e.g. GCS bucket), download it directly.
+    // Otherwise fall back to the MaxMind tar.gz download flow.
+    if let Ok(url) = env::var(MAXMIND_DB_URL_ENV_VAR_NAME) {
+        download_database_from_url(&url).await
+    } else {
+        extract_database(&download_from_maxmind().await?)
+    }
 }
 
 fn is_database_expired() -> bool {
@@ -121,7 +129,29 @@ fn is_database_expired() -> bool {
     }
 }
 
-async fn download_database() -> Result<String, GeoIpError> {
+/// Download the .mmdb file directly from a URL (e.g. a GCS bucket).
+async fn download_database_from_url(url: &str) -> Result<(), GeoIpError> {
+    let mut database_file = fs::File::create(DATABASE_FILE_PATH)?;
+
+    let mut res = reqwest::get(url)
+        .await
+        .map_err(|e| GeoIpError::Other(format!("{}", e)))?;
+
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .map_err(|e| GeoIpError::Other(format!("{}", e)))?
+    {
+        database_file
+            .write_all(&chunk[..])
+            .map_err(|e| GeoIpError::Other(format!("{}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// Download the tar.gz from MaxMind and return the path to the downloaded file.
+async fn download_from_maxmind() -> Result<String, GeoIpError> {
     let license_key = env::var(MAXMIND_DB_LICENSE_KEY_ENV_VAR_NAME)?;
     let url = format!("https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key={}&suffix=tar.gz", license_key);
 
