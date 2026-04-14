@@ -1,16 +1,17 @@
 [package]
 authors = ["Gulshan Dhingra <gdgulshan.007@gmail.com>"]
 description = "MaxmindDB GeoLocation"
-edition = "2018"
+edition = "2024"
 homepage = "https://github.com/DGulshan/maxmind-geoip-rs"
 license = "MIT"
 name = "maxmind-geoip"
 readme = "README.md"
 repository = "https://github.com/DGulshan/maxmind-geoip-rs"
-version = "0.1.0"
+version = "0.2.0"
 
 [dependencies]
-libflate = "1.3.0"
-maxminddb = "0.23.0"
-reqwest = "0.11.4"
+flate2 = "1"
+maxminddb = "0.27.3"
+reqwest = "0.13.2"
 tar = "0.4"
+tokio = { version = "1", features = ["sync"] }

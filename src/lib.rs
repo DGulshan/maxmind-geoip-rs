@@ -1,23 +1,33 @@
-use libflate::gzip::Decoder;
+use flate2::read::GzDecoder;
 use maxminddb::geoip2;
 use std::env::VarError;
-use std::io::{copy, Error as IOError, Write};
+use std::io::{Error as IOError, Write, copy};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::{env, fs, net::IpAddr, path::Path};
 use tar::Archive;
+use tokio::sync::Mutex;
 
 static DATABASE_EXPIRATION_DURATION: u64 = 3600 * 24 * 7;
 
-static DATABASE_FILE_PATH: &str = "./GeoLite2-City.mmdb";
+static DATABASE_FILE_NAME: &str = "GeoLite2-City.mmdb";
 
-static DOWNLOADED_FILE: &str = "GeoLite2-City.mmdb.tar.gz";
-
-static TAR_FILE: &str = "GeoLite2-City.mmdb.tar";
+fn database_file_path() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| env::temp_dir().join(DATABASE_FILE_NAME))
+        .as_path()
+}
 
 static MAXMIND_DB_LICENSE_KEY_ENV_VAR_NAME: &str = "MAXMIND_DB_LICENSE_KEY";
 
 static MAXMIND_DB_URL_ENV_VAR_NAME: &str = "MAXMIND_DB_URL";
 
 static UNKNOWN: &str = "Unknown";
+
+static DB_READER: OnceLock<maxminddb::Reader<Vec<u8>>> = OnceLock::new();
+
+/// Guards database download so only one task downloads at a time.
+static DOWNLOAD_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Debug)]
 pub struct GeoLocation {
@@ -27,7 +37,7 @@ pub struct GeoLocation {
 
 #[derive(Debug)]
 pub enum GeoIpError {
-    DBLookupError(maxminddb::MaxMindDBError),
+    DBLookupError(maxminddb::MaxMindDbError),
     IO(IOError),
     Other(String),
 }
@@ -38,34 +48,8 @@ pub struct MaxMindDb;
 impl GeoLocation {
     pub fn new(geoip: geoip2::City) -> Self {
         Self {
-            city: Self::city(geoip.city),
-            country: Self::country(geoip.country),
-        }
-    }
-
-    fn city(geoip_city: Option<geoip2::city::City>) -> String {
-        match geoip_city {
-            None => UNKNOWN.to_string(),
-            Some(gc) => match gc.names {
-                None => UNKNOWN.to_string(),
-                Some(names) => match names.get("en") {
-                    None => UNKNOWN.to_string(),
-                    Some(name) => name.to_string(),
-                },
-            },
-        }
-    }
-
-    fn country(geoip_city: Option<geoip2::country::Country>) -> String {
-        match geoip_city {
-            None => UNKNOWN.to_string(),
-            Some(gc) => match gc.names {
-                None => UNKNOWN.to_string(),
-                Some(c) => match c.get("en") {
-                    None => UNKNOWN.to_string(),
-                    Some(name) => name.to_string(),
-                },
-            },
+            city: geoip.city.names.english.unwrap_or(UNKNOWN).to_string(),
+            country: geoip.country.names.english.unwrap_or(UNKNOWN).to_string(),
         }
     }
 }
@@ -76,8 +60,8 @@ impl From<IOError> for GeoIpError {
     }
 }
 
-impl From<maxminddb::MaxMindDBError> for GeoIpError {
-    fn from(value: maxminddb::MaxMindDBError) -> Self {
+impl From<maxminddb::MaxMindDbError> for GeoIpError {
+    fn from(value: maxminddb::MaxMindDbError) -> Self {
         GeoIpError::DBLookupError(value)
     }
 }
@@ -90,34 +74,51 @@ impl From<VarError> for GeoIpError {
 
 impl MaxMindDb {
     pub async fn lookup(ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
-        let db = database().await?;
-        let geoip: geoip2::City = db.lookup(ip)?;
+        let db = get_or_init_reader().await?;
+        let result = db.lookup(ip)?;
+        let geoip: geoip2::City = result
+            .decode()?
+            .ok_or_else(|| GeoIpError::Other("No city data found for IP".to_owned()))?;
         Ok(GeoLocation::new(geoip))
     }
 }
 
-async fn database() -> Result<maxminddb::Reader<Vec<u8>>, GeoIpError> {
+async fn get_or_init_reader() -> Result<&'static maxminddb::Reader<Vec<u8>>, GeoIpError> {
+    if let Some(reader) = DB_READER.get()
+        && !is_database_expired()
+    {
+        return Ok(reader);
+    }
+
     ready_database().await?;
-    let db = maxminddb::Reader::open_readfile(DATABASE_FILE_PATH)?;
-    Ok(db)
+    let reader = maxminddb::Reader::open_readfile(database_file_path())?;
+
+    // If another task initialized it first, that's fine — we just use theirs.
+    Ok(DB_READER.get_or_init(|| reader))
 }
 
 async fn ready_database() -> Result<(), GeoIpError> {
-    if Path::new(DATABASE_FILE_PATH).exists() && !is_database_expired() {
+    if database_file_path().exists() && !is_database_expired() {
         return Ok(());
     }
 
-    // If a direct URL to the .mmdb file is provided (e.g. GCS bucket), download it directly.
-    // Otherwise fall back to the MaxMind tar.gz download flow.
+    // Only one task downloads at a time. Others wait and then find the file ready.
+    let _guard = DOWNLOAD_LOCK.lock().await;
+
+    // Re-check after acquiring the lock — another task may have just finished downloading.
+    if database_file_path().exists() && !is_database_expired() {
+        return Ok(());
+    }
+
     if let Ok(url) = env::var(MAXMIND_DB_URL_ENV_VAR_NAME) {
         download_database_from_url(&url).await
     } else {
-        extract_database(&download_from_maxmind().await?)
+        download_and_extract_from_maxmind().await
     }
 }
 
 fn is_database_expired() -> bool {
-    match fs::metadata(DATABASE_FILE_PATH) {
+    match fs::metadata(database_file_path()) {
         Ok(metadata) => match metadata.modified() {
             Ok(modified) => match modified.elapsed() {
                 Ok(elapsed) => elapsed.as_secs() >= DATABASE_EXPIRATION_DURATION,
@@ -130,81 +131,94 @@ fn is_database_expired() -> bool {
 }
 
 /// Download the .mmdb file directly from a URL (e.g. a GCS bucket).
+/// Writes to a temp file first, then atomically renames to avoid partial files.
 async fn download_database_from_url(url: &str) -> Result<(), GeoIpError> {
-    let mut database_file = fs::File::create(DATABASE_FILE_PATH)?;
+    let tmp_path = database_file_path().with_extension("mmdb.tmp");
+    let mut tmp_file = fs::File::create(&tmp_path)?;
 
-    let mut res = reqwest::get(url)
+    let res = reqwest::get(url)
         .await
-        .map_err(|e| GeoIpError::Other(format!("{}", e)))?;
+        .map_err(|e| GeoIpError::Other(format!("Failed to download from {}: {}", url, e)))?;
 
-    while let Some(chunk) = res
-        .chunk()
-        .await
-        .map_err(|e| GeoIpError::Other(format!("{}", e)))?
-    {
-        database_file
-            .write_all(&chunk[..])
-            .map_err(|e| GeoIpError::Other(format!("{}", e)))?;
+    if !res.status().is_success() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(GeoIpError::Other(format!(
+            "Download from {} failed with HTTP {}",
+            url,
+            res.status()
+        )));
     }
+
+    let bytes = res.bytes().await.map_err(|e| {
+        GeoIpError::Other(format!("Failed to read response body from {}: {}", url, e))
+    })?;
+
+    tmp_file.write_all(&bytes).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        GeoIpError::Other(format!("Failed to write database file: {}", e))
+    })?;
+
+    fs::rename(&tmp_path, database_file_path()).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        GeoIpError::Other(format!("Failed to rename temp file: {}", e))
+    })?;
 
     Ok(())
 }
 
-/// Download the tar.gz from MaxMind and return the path to the downloaded file.
-async fn download_from_maxmind() -> Result<String, GeoIpError> {
+/// Download the tar.gz from MaxMind, extract the .mmdb, and write it atomically.
+async fn download_and_extract_from_maxmind() -> Result<(), GeoIpError> {
     let license_key = env::var(MAXMIND_DB_LICENSE_KEY_ENV_VAR_NAME)?;
-    let url = format!("https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key={}&suffix=tar.gz", license_key);
+    let url = format!(
+        "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key={}&suffix=tar.gz",
+        license_key
+    );
 
-    let temp_file_path = env::temp_dir().join(DOWNLOADED_FILE);
-    let temp_file_path = temp_file_path
-        .as_path()
-        .to_str()
-        .ok_or_else(|| GeoIpError::Other("Could not get path for the download file.".to_owned()))?;
-
-    let mut temp_file = fs::File::create(temp_file_path)?;
-
-    let mut res = reqwest::get(&url)
+    let res = reqwest::get(&url)
         .await
-        .map_err(|e| GeoIpError::Other(format!("{}", e)))?;
+        .map_err(|e| GeoIpError::Other(format!("Failed to download from MaxMind: {}", e)))?;
 
-    while let Some(chunk) = res
-        .chunk()
-        .await
-        .map_err(|e| GeoIpError::Other(format!("{}", e)))?
-    {
-        temp_file
-            .write_all(&chunk[..])
-            .map_err(|e| GeoIpError::Other(format!("{}", e)))?;
+    if !res.status().is_success() {
+        return Err(GeoIpError::Other(format!(
+            "MaxMind download failed with HTTP {}",
+            res.status()
+        )));
     }
 
-    Ok(temp_file_path.to_string())
-}
+    let bytes = res
+        .bytes()
+        .await
+        .map_err(|e| GeoIpError::Other(format!("Failed to read MaxMind response body: {}", e)))?;
 
-fn extract_database(downloaded_file_path: &str) -> Result<(), GeoIpError> {
-    let mut downloaded_file = fs::File::open(downloaded_file_path)?;
-    let mut decoder = Decoder::new(&mut downloaded_file)?;
+    let decoder = GzDecoder::new(&bytes[..]);
+    let mut archive = Archive::new(decoder);
 
-    let tar_file_path = env::temp_dir().join(TAR_FILE);
-    let tar_file_path = tar_file_path
-        .as_path()
-        .to_str()
-        .ok_or_else(|| GeoIpError::Other("Could not get path for the tar file.".to_owned()))?;
+    let tmp_path = database_file_path().with_extension("mmdb.tmp");
+    let mut found = false;
 
-    let mut tar_file = fs::File::create(tar_file_path)?;
-    copy(&mut decoder, &mut tar_file)?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
 
-    let mut tar_file = Archive::new(fs::File::open(tar_file_path)?);
-    let mut database_file = fs::File::create(DATABASE_FILE_PATH)?;
-
-    for file in tar_file.entries()? {
-        let mut f = file?;
-
-        let file_path = f.path()?;
-
-        if file_path.file_name().unwrap_or_default() == "GeoLite2-City.mmdb" {
-            copy(&mut f, &mut database_file)?;
+        if path.file_name().unwrap_or_default() == "GeoLite2-City.mmdb" {
+            let mut tmp_file = fs::File::create(&tmp_path)?;
+            copy(&mut entry, &mut tmp_file)?;
+            found = true;
+            break;
         }
     }
+
+    if !found {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(GeoIpError::Other(
+            "GeoLite2-City.mmdb not found in MaxMind archive".to_owned(),
+        ));
+    }
+
+    fs::rename(&tmp_path, database_file_path()).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        GeoIpError::Other(format!("Failed to rename temp file: {}", e))
+    })?;
 
     Ok(())
 }
