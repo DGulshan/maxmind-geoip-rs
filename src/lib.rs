@@ -111,8 +111,10 @@ async fn ready_database() -> Result<(), GeoIpError> {
     }
 
     if let Ok(url) = env::var(MAXMIND_DB_URL_ENV_VAR_NAME) {
+        eprintln!("[maxmind-geoip] Downloading database from custom URL");
         download_database_from_url(&url).await
     } else {
+        eprintln!("[maxmind-geoip] Downloading database from MaxMind");
         download_and_extract_from_maxmind().await
     }
 }
